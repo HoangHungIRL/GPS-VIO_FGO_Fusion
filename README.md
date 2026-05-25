@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="doc/vins_gps.gif" alt="VINS-GPS Demo" width="100%">
+</p>
+
 # GPS-VIO_FGO_Fusion
 
 ROS2-based GPS and Visual-Inertial Odometry (VIO) fusion framework using Factor Graph Optimization (FGO) for robust and accurate localization.  
