@@ -1,0 +1,71 @@
+#########################################################
+# GPS TO LOCAL CONVERTER PARAMETERS 
+#########################################################
+pose_graph_fusion_node:
+  ros__parameters:
+    # ---------------------------------------------
+    # 1. TOPIC CONFIGURATIONS
+    # ---------------------------------------------
+    odom_sub_topic: "/vins_estimator/odometry"
+    gps_sub_topic: "/gps/fix_base_link"
+    odom_pub_topic: "/vins_gps_odom"
+    path_pub_topic: "/vins_gps_path"
+    gps_pub_topic: "/vins_gps_fix"
+    
+    # ---------------------------------------------
+    # 2. FRAME CONFIGURATIONS
+    # ---------------------------------------------
+    global_frame_id: "world"
+    base_frame_id: "base_link"
+    gps_frame_type: "enu"
+
+    # ---------------------------------------------
+    # 3. ALGORITHM CONFIGURATIONS
+    # ---------------------------------------------
+    keyframe_meter_gap: 0.3
+    keyframe_deg_gap: 10.0
+    gps_cov_threshold: 5.0
+    output_yaw_offset: 180.0
+    
+    # ---------------------------------------------
+    # 4. GTSAM NOISE PARAMS
+    # ---------------------------------------------
+    noise_prior_rot: 0.0001
+    noise_prior_trans: 0.0001
+    noise_odom_rot: 0.0001
+    noise_odom_trans: 0.1
+
+tgins_local_converter:
+  ros__parameters:
+    # 1. Topics
+    gps_sub_topic: "/fix"
+    imu_sub_topic: "/imu/data_newIMU"
+    gps_odom_pub_topic: "/gps/odom_local"
+    imu_odom_pub_topic: "/imu_eskf/odom"
+    gps_path_pub_topic: "/gps/path"
+    gps_raw_path_pub_topic: "/gps/raw_path"
+    base_link_gps_pub_topic: "/gps/fix_base_link"
+
+    # 2. Frames
+    global_frame_id: "world"
+    base_frame_id: "base_link"
+    gps_frame_type: "enu"
+    imu_frame_type: "enu"
+
+    # 3. Lever Arm (Offset from base_link to GPS Antenna)
+    lever_arm_x: -3.3
+    lever_arm_y: 0.7
+    lever_arm_z: 0.0
+
+    # 4. Alignment & Update Logic
+    min_align_dist: 1.5
+    enable_yaw_alignment: true
+    planar_mode: true
+    continuous_yaw_update: true
+    update_distance: 3.0
+    yaw_update_rate: 0.05
+
+    # 5. Static Detection
+    enable_static_detection: true
+    imu_accel_var_thresh: 0.05
+    imu_gyro_thresh: 0.02
