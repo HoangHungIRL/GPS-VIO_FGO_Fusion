@@ -1,0 +1,446 @@
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/image_encodings.hpp>
+#include <sensor_msgs/msg/point_cloud.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <cv_bridge/cv_bridge.h>
+#include <message_filters/subscriber.h>
+
+#include "feature_tracker.h"
+
+#define SHOW_UNDISTORTION 0
+
+// ✅ Global variables
+rclcpp::Node::SharedPtr node;
+
+// Depth register
+DepthRegister *depthRegister;
+
+// LiDAR depth cloud
+pcl::PointCloud<PointType>::Ptr depthCloud(new pcl::PointCloud<PointType>());
+deque<pcl::PointCloud<PointType>> cloudQueue;
+deque<double> timeQueue;
+std::mutex mtx_lidar;
+
+
+std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+geometry_msgs::msg::TransformStamped transform;
+
+static pcl::VoxelGrid<PointType> downSizeFilter;
+//
+
+vector<uchar> r_status;
+vector<float> r_err;
+queue<sensor_msgs::msg::Image::ConstSharedPtr> img_buf;
+
+rclcpp::Publisher<sensor_msgs::msg::PointCloud>::SharedPtr pub_img;
+rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_match;
+rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_restart;
+
+FeatureTracker trackerData[NUM_OF_CAM];
+double first_image_time;
+int pub_count = 1;
+bool first_image_flag = true;
+double last_image_time = 0;
+bool init_pub = 0;
+// rclcpp::Node::SharedPtr node;
+
+template <typename T>
+double toSec(const T &time) {
+    return time.sec + time.nanosec / 1e9;
+}
+
+void img_callback(sensor_msgs::msg::Image::ConstSharedPtr img_msg)
+{
+    if(first_image_flag)
+    {
+        first_image_flag = false;
+        first_image_time = toSec(img_msg->header.stamp);
+        last_image_time = toSec(img_msg->header.stamp);
+        return;
+    }
+    // detect unstable camera stream
+    if (toSec(img_msg->header.stamp) - last_image_time > 1.0 || toSec(img_msg->header.stamp) < last_image_time)
+    {
+        RCLCPP_WARN(node->get_logger(), "%s image discontinue! reset the feature tracker!", AT);
+        first_image_flag = true; 
+        last_image_time = 0;
+        pub_count = 1;
+        std_msgs::msg::Bool restart_flag;
+        restart_flag.data = true;
+        pub_restart->publish(restart_flag);
+        return;
+    }
+    last_image_time = toSec(img_msg->header.stamp);
+    // frequency control
+    if (round(1.0 * pub_count / (toSec(img_msg->header.stamp) - first_image_time)) <= FREQ)
+    {
+        PUB_THIS_FRAME = true;
+        // reset the frequency control
+        if (abs(1.0 * pub_count / (toSec(img_msg->header.stamp) - first_image_time) - FREQ) < 0.01 * FREQ)
+        {
+            first_image_time = toSec(img_msg->header.stamp);
+            pub_count = 0;
+        }
+    }
+    else
+        PUB_THIS_FRAME = false;
+
+    cv_bridge::CvImageConstPtr ptr;
+    if (img_msg->encoding == "8UC1")
+    {
+        sensor_msgs::msg::Image img;
+        img.header = img_msg->header;
+        img.height = img_msg->height;
+        img.width = img_msg->width;
+        img.is_bigendian = img_msg->is_bigendian;
+        img.step = img_msg->step;
+        img.data = img_msg->data;
+        img.encoding = "mono8";
+        ptr = cv_bridge::toCvCopy(img, sensor_msgs::image_encodings::MONO8);
+    }
+    else
+        ptr = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::MONO8);
+
+    cv::Mat show_img = ptr->image;
+    TicToc t_r;
+    for (int i = 0; i < NUM_OF_CAM; i++)
+    {
+        RCLCPP_DEBUG(node->get_logger(), "%s processing camera %d", AT, i);
+        if (i != 1 || !STEREO_TRACK)
+            trackerData[i].readImage(ptr->image.rowRange(ROW * i, ROW * (i + 1)), toSec(img_msg->header.stamp));
+        else
+        {
+            if (EQUALIZE)
+            {
+                cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE();
+                clahe->apply(ptr->image.rowRange(ROW * i, ROW * (i + 1)), trackerData[i].cur_img);
+            }
+            else
+                trackerData[i].cur_img = ptr->image.rowRange(ROW * i, ROW * (i + 1));
+        }
+
+#if SHOW_UNDISTORTION
+        trackerData[i].showUndistortion("undistrotion_" + std::to_string(i));
+#endif
+    }
+
+    for (unsigned int i = 0;; i++)
+    {
+        bool completed = false;
+        for (int j = 0; j < NUM_OF_CAM; j++)
+            if (j != 1 || !STEREO_TRACK)
+                completed |= trackerData[j].updateID(i);
+        if (!completed)
+            break;
+    }
+
+   if (PUB_THIS_FRAME)
+   {
+        pub_count++;
+        sensor_msgs::msg::PointCloud::SharedPtr feature_points(new sensor_msgs::msg::PointCloud);
+        sensor_msgs::msg::ChannelFloat32 id_of_point;
+        sensor_msgs::msg::ChannelFloat32 u_of_point;
+        sensor_msgs::msg::ChannelFloat32 v_of_point;
+        sensor_msgs::msg::ChannelFloat32 velocity_x_of_point;
+        sensor_msgs::msg::ChannelFloat32 velocity_y_of_point;
+
+        feature_points->header = img_msg->header;
+        feature_points->header.frame_id = "world";
+
+        vector<set<int>> hash_ids(NUM_OF_CAM);
+        for (int i = 0; i < NUM_OF_CAM; i++)
+        {
+            auto &un_pts = trackerData[i].cur_un_pts;
+            auto &cur_pts = trackerData[i].cur_pts;
+            auto &ids = trackerData[i].ids;
+            auto &pts_velocity = trackerData[i].pts_velocity;
+            for (unsigned int j = 0; j < ids.size(); j++)
+            {
+                if (trackerData[i].track_cnt[j] > 1)
+                {
+                    int p_id = ids[j];
+                    hash_ids[i].insert(p_id);
+                    geometry_msgs::msg::Point32 p;
+                    p.x = un_pts[j].x;
+                    p.y = un_pts[j].y;
+                    p.z = 1;
+
+                    feature_points->points.push_back(p);
+                    id_of_point.values.push_back(p_id * NUM_OF_CAM + i);
+                    u_of_point.values.push_back(cur_pts[j].x);
+                    v_of_point.values.push_back(cur_pts[j].y);
+                    velocity_x_of_point.values.push_back(pts_velocity[j].x);
+                    velocity_y_of_point.values.push_back(pts_velocity[j].y);
+                }
+            }
+        }
+        feature_points->channels.push_back(id_of_point);
+        feature_points->channels.push_back(u_of_point);
+        feature_points->channels.push_back(v_of_point);
+        feature_points->channels.push_back(velocity_x_of_point);
+        feature_points->channels.push_back(velocity_y_of_point);
+        RCLCPP_DEBUG(node->get_logger(), "%s publish %f, at %f", AT, toSec(feature_points->header.stamp), rclcpp::Clock().now().nanoseconds() / 1e9);
+        
+
+        // ✅ DUY ADDDDDDDD // 
+        // get feature depth from lidar point cloud
+        pcl::PointCloud<PointType>::Ptr depth_cloud_temp(new pcl::PointCloud<PointType>());
+        mtx_lidar.lock();
+        *depth_cloud_temp = *depthCloud;
+        mtx_lidar.unlock();
+
+        //  Convert header.stamp to rclcpp::Time
+        rclcpp::Time stamp_cur(img_msg->header.stamp);
+
+        sensor_msgs::msg::ChannelFloat32 depth_of_points = depthRegister->get_depth(stamp_cur, 
+            show_img, 
+            depth_cloud_temp, 
+            trackerData[0].m_camera, 
+            feature_points->points);
+            
+        feature_points->channels.push_back(depth_of_points);
+        //
+        
+        
+        // skip the first image; since no optical speed on frist image
+        if (!init_pub)
+        {
+            init_pub = 1;
+        }
+        else
+            pub_img->publish(*feature_points);
+
+        if (pub_match->get_subscription_count() != 0)
+        {
+            ptr = cv_bridge::cvtColor(ptr, sensor_msgs::image_encodings::BGR8);
+            //cv::Mat stereo_img(ROW * NUM_OF_CAM, COL, CV_8UC3);
+            cv::Mat stereo_img = ptr->image;
+
+            for (int i = 0; i < NUM_OF_CAM; i++)
+            {
+                cv::Mat tmp_img = stereo_img.rowRange(i * ROW, (i + 1) * ROW);
+                cv::cvtColor(show_img, tmp_img, CV_GRAY2RGB);
+
+                for (unsigned int j = 0; j < trackerData[i].cur_pts.size(); j++)
+                {
+                    if (SHOW_TRACK)
+                    {
+                        // track count
+                        double len = std::min(1.0, 1.0 * trackerData[i].track_cnt[j] / WINDOW_SIZE);
+                        cv::circle(tmp_img, trackerData[i].cur_pts[j], 4, cv::Scalar(255 * (1 - len), 255 * len, 0), 4);
+                    } 
+                    else 
+                    {
+                        // depth 
+                        if(j < depth_of_points.values.size())
+                        {
+                            if (depth_of_points.values[j] > 0)
+                                cv::circle(tmp_img, trackerData[i].cur_pts[j], 4, cv::Scalar(0, 255, 0), 4);      //xanh lá
+                            else
+                                cv::circle(tmp_img, trackerData[i].cur_pts[j], 4, cv::Scalar(0, 0, 255), 4);      // mau do 
+                        }
+                    }
+                }
+            }
+            //cv::imshow("vis", stereo_img);
+            //cv::waitKey(5);
+            pub_match->publish(*ptr->toImageMsg());
+        }
+    }
+    // RCLCPP_INFO(node->get_logger(), "%s whole feature tracker processing costs: %f ms", AT, t_r.toc());
+}
+
+
+void lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr laser_msg)
+{
+    static int lidar_count = -1;
+    if (++lidar_count % (LIDAR_SKIP+1) != 0)
+        return;
+
+    // RCLCPP_INFO(node->get_logger(), "========== LIDAR CALLBACK START ==========");
+    // RCLCPP_INFO(node->get_logger(), "[0] Lidar count: %d", lidar_count);
+
+    // 0. listen to transform
+    geometry_msgs::msg::TransformStamped transform;
+    try {
+        // ✅ Use latest available transform instead of message timestamp
+        transform = tf_buffer_->lookupTransform(
+            "world", "camera",      // chuyen tu camera frame --> world frame
+            tf2::TimePointZero);  // Get latest transform
+        // RCLCPP_INFO(node->get_logger(), "[0] TF lookup SUCCESS");
+    } 
+    catch (tf2::TransformException& ex) {
+        // RCLCPP_WARN(node->get_logger(), "[0] TF lookup FAILED: %s", ex.what());
+        return;
+    }
+
+    // 0. Extract translation (pose camera)
+    // pos cua imu trong world frame 
+    double xCur = transform.transform.translation.x;
+    double yCur = transform.transform.translation.y;
+    double zCur = transform.transform.translation.z;
+    
+    // RCLCPP_INFO(node->get_logger(), "[0] Translation: [%.3f, %.3f, %.3f]", xCur, yCur, zCur);
+    
+    // 0.1 Extract rotation, sau do chuyen sang RPy (pose camera)
+    tf2::Quaternion q(transform.transform.rotation.x,transform.transform.rotation.y,transform.transform.rotation.z,transform.transform.rotation.w);
+    tf2::Matrix3x3 m(q);
+
+    // convert quaternion rotation --> RPY
+    double rollCur, pitchCur, yawCur;
+    m.getRPY(rollCur, pitchCur, yawCur);
+    
+    // RCLCPP_INFO(node->get_logger(), "[0] RPY: [%.3f, %.3f, %.3f] deg", rollCur*180/M_PI, pitchCur*180/M_PI, yawCur*180/M_PI);
+    
+    Eigen::Affine3f transNow = pcl::getTransformation(xCur, yCur, zCur, rollCur, pitchCur, yawCur); // Dùng THUẬN: Camera → World ✅
+
+    // 1. convert laser cloud message to pcl
+    // chuyen msg cua ros ve pcl
+    pcl::PointCloud<PointType>::Ptr laser_cloud_in(new pcl::PointCloud<PointType>());
+    pcl::fromROSMsg(*laser_msg, *laser_cloud_in);  
+
+    // RCLCPP_INFO(node->get_logger(), "[1] Input cloud size: %zu points", laser_cloud_in->size());
+
+    // 2. downsample new cloud (save memory)
+    pcl::PointCloud<PointType>::Ptr laser_cloud_in_ds(new pcl::PointCloud<PointType>());
+    static pcl::VoxelGrid<PointType> downSizeFilter;
+    downSizeFilter.setLeafSize(0.2, 0.2, 0.2);
+    downSizeFilter.setInputCloud(laser_cloud_in);
+    downSizeFilter.filter(*laser_cloud_in_ds);
+    *laser_cloud_in = *laser_cloud_in_ds;
+    
+    // RCLCPP_INFO(node->get_logger(), "[2] After downsample: %zu points", laser_cloud_in->size());
+
+    // 3. filter lidar points (only keep points in camera view, giu nhung diem phia truoc camera)
+    pcl::PointCloud<PointType>::Ptr laser_cloud_in_filter(new pcl::PointCloud<PointType>());
+    for (int i = 0; i < (int)laser_cloud_in->size(); ++i)
+    {
+        PointType p = laser_cloud_in->points[i];
+        if (p.x >= 0 && abs(p.y / p.x) <= 10 && abs(p.z / p.x) <= 10)
+            laser_cloud_in_filter->push_back(p);
+    }
+    *laser_cloud_in = *laser_cloud_in_filter;
+    // RCLCPP_INFO(node->get_logger(), "[3] After camera FOV filter: %zu points", laser_cloud_in->size());
+
+    // 4. offset T_lidar -> T_camera 
+    pcl::PointCloud<PointType>::Ptr laser_cloud_offset(new pcl::PointCloud<PointType>());
+    Eigen::Affine3f trans_camera_lidar = pcl::getTransformation(L_C_TX, L_C_TY, L_C_TZ, L_C_RX, L_C_RY, L_C_RZ);
+    pcl::transformPointCloud(*laser_cloud_in, *laser_cloud_offset, trans_camera_lidar);
+    *laser_cloud_in = *laser_cloud_offset;  // dem point cloud ve camera frame
+    // RCLCPP_INFO(node->get_logger(), "[4] Lidar->Camera transform: T=[%.3f,%.3f,%.3f], R=[%.3f,%.3f,%.3f]", L_C_TX, L_C_TY, L_C_TZ, L_C_RX*180/M_PI, L_C_RY*180/M_PI, L_C_RZ*180/M_PI);
+
+
+    // 5. transform new cloud into global odom frame
+    pcl::PointCloud<PointType>::Ptr laser_cloud_global(new pcl::PointCloud<PointType>());
+    pcl::transformPointCloud(*laser_cloud_in, *laser_cloud_global, transNow);          // ???? la dem ve frame nao
+    // RCLCPP_INFO(node->get_logger(), "[5] Transformed to global frame: %zu points", laser_cloud_global->size());
+
+    // 6. save new cloud
+    double timeScanCur = rclcpp::Time(laser_msg->header.stamp).seconds();
+    cloudQueue.push_back(*laser_cloud_global);
+    timeQueue.push_back(timeScanCur);
+
+    // RCLCPP_INFO(node->get_logger(), "[6] Cloud added to queue. Time: %.3f, Queue size: %zu", timeScanCur, cloudQueue.size());
+
+    // 7. pop old cloud
+    int removed_count = 0;
+    while (!timeQueue.empty())
+    {
+        if (timeScanCur - timeQueue.front() > 5.0)
+        {
+            cloudQueue.pop_front();
+            timeQueue.pop_front();
+            removed_count++;
+        } else {
+            break;
+        }
+    }
+    // RCLCPP_INFO(node->get_logger(), "[7] Removed %d old clouds. Remaining queue size: %zu", removed_count, cloudQueue.size());
+
+    std::lock_guard<std::mutex> lock(mtx_lidar);
+    
+    // 8. fuse global cloud
+    depthCloud->clear();
+    for (int i = 0; i < (int)cloudQueue.size(); ++i)
+        *depthCloud += cloudQueue[i];
+    // RCLCPP_INFO(node->get_logger(), "[8] Fused cloud total points: %zu", depthCloud->size());
+
+    // 9. downsample global cloud
+    pcl::PointCloud<PointType>::Ptr depthCloudDS(new pcl::PointCloud<PointType>());
+    downSizeFilter.setLeafSize(0.2, 0.2, 0.2);
+    downSizeFilter.setInputCloud(depthCloud);
+    downSizeFilter.filter(*depthCloudDS);
+    *depthCloud = *depthCloudDS;
+    // RCLCPP_INFO(node->get_logger(), "[9] Final downsampled cloud: %zu points", depthCloud->size());
+    // RCLCPP_INFO(node->get_logger(), "========== LIDAR CALLBACK END ==========\n");
+}
+
+
+int main(int argc, char **argv)
+{
+    rclcpp::init(argc, argv);
+    node = rclcpp::Node::make_shared("feature_tracker");
+    // rcutils_logging_set_logger_level(node->get_logger().get_name(), RCUTILS_LOG_SEVERITY_DEBUG);
+    readParameters(node);
+
+    for (int i = 0; i < NUM_OF_CAM; i++)
+        trackerData[i].readIntrinsicParameter(CAM_NAMES[i]);
+
+    if(FISHEYE)
+    {
+        for (int i = 0; i < NUM_OF_CAM; i++)
+        {
+            trackerData[i].fisheye_mask = cv::imread(FISHEYE_MASK, 0);
+            if(!trackerData[i].fisheye_mask.data)
+            {
+                RCLCPP_INFO(node->get_logger(), "%s load mask fail", AT);
+            }
+            else
+                RCLCPP_INFO(node->get_logger(), "%s load mask success", AT);
+        }
+    }
+
+    // duu add
+    // Initialize depthRegister (after readParameters())
+
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+    depthRegister = new DepthRegister(node);  // ✅ Fixed: use 'node' not 'n'
+
+    auto sub_img = node->create_subscription<sensor_msgs::msg::Image>(IMAGE_TOPIC, rclcpp::QoS(rclcpp::KeepLast(100)), img_callback);
+
+    //duy add
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_lidar;
+    if (USE_LIDAR)
+    {
+        sub_lidar = node->create_subscription<sensor_msgs::msg::PointCloud2>(POINT_CLOUD_TOPIC, rclcpp::QoS(rclcpp::KeepLast(1)), lidar_callback);
+    }
+
+    pub_img = node->create_publisher<sensor_msgs::msg::PointCloud>("/feature_tracker/feature", 1000);
+    pub_match = node->create_publisher<sensor_msgs::msg::Image>("/feature_tracker/feature_img",1000);
+    pub_restart = node->create_publisher<std_msgs::msg::Bool>("/feature_tracker/restart",1000);
+    /*
+    if (SHOW_TRACK)
+        cv::namedWindow("vis", cv::WINDOW_NORMAL);
+    */
+
+    // Multi-thread executor giống spinner(2)
+    // Two ROS spinners for parallel processing (image and lidar)
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+    executor.add_node(node);
+    executor.spin();
+
+    rclcpp::shutdown();
+    return 0;
+
+    // rclcpp::spin(node);
+    // return 0;
+}
+
+
+// new points velocity is 0, pub or not?
+// track cnt > 1 pub?
